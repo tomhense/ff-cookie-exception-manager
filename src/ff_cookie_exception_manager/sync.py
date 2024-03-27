@@ -2,9 +2,9 @@ import argparse
 import configparser
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Self
 
 from ff_cookie_exception_manager import ff, logger, webdav
 
@@ -113,16 +113,17 @@ def downloadSyncState(webdavClient: webdav.WebDAVClient) -> dict:
     return syncState
 
 
-def uploadSyncState(webdavClient: webdav.WebDAVClient, syncState: dict) -> None:
+def uploadSyncState(
+    webdavClient: webdav.WebDAVClient,
+    syncState: dict,
+    path: str = "/ff-cookie-exceptions/sync.json",
+) -> None:
     # Upload the exceptions
     try:
         webdavClient.upload(
-            "/ff-cookie-exceptions/sync.json",
+            path,
             json.dumps(
-                {
-                    "syncDate": syncState["syncDate"],
-                    "exceptionRules": syncState["exceptionRules"],
-                },
+                syncState,
                 cls=ff.CustomEncoder,
                 indent=4,
             ),
@@ -132,60 +133,79 @@ def uploadSyncState(webdavClient: webdav.WebDAVClient, syncState: dict) -> None:
         exit(1)
 
 
-class Changes:
-    def __init__(
-        self,
-        added: set[ff.CookieExceptionRule],
-        removed: set[ff.CookieExceptionRule],
-        modified: set[ff.CookieExceptionRule],
-    ) -> None:
-        self.added = added
-        self.removed = removed
-        self.modified = modified
-
-    def removeRule(self, rule: ff.CookieExceptionRule) -> None:
-        if rule in self.added:
-            self.added.remove(rule)
-        elif rule in self.removed:
-            self.removed.remove(rule)
-        elif rule in self.modified:
-            self.modified.remove(rule)
-
-    @classmethod
-    def mergeChanges(cls, localChanges: Self, remoteChanges: Self) -> Self:
-        # Be careful this method may modify the input sets
-
-        # If a rule is in both local and remote changes, we need to compare their modification times and keep the most recent one
-        for i in localChanges.added | localChanges.removed | localChanges.modified:
-            for j in (
-                remoteChanges.added | remoteChanges.removed | remoteChanges.modified
-            ):
-                if i.origin == j.origin:
-                    if i.modificationTime > j.modificationTime:
-                        remoteChanges.removeRule(j)
-                    else:
-                        localChanges.removeRule(i)
-
-        return cls(
-            localChanges.added | remoteChanges.added,
-            localChanges.removed | remoteChanges.removed,
-            localChanges.modified | remoteChanges.modified,
+def backupSyncStateRemote(webdavClient: webdav.WebDAVClient) -> None:
+    # Not used currently
+    try:
+        sync_state = downloadSyncState(webdavClient)
+        iso_date = datetime.now().isoformat()[:19].replace(":", "-")
+        uploadSyncState(
+            webdavClient,
+            sync_state,
+            path=f"/ff-cookie-exceptions/backups/backup_{iso_date}.json",
         )
 
-    @classmethod
-    def computeDiff(
-        cls,
-        newState: set[ff.CookieExceptionRule],
-        oldState: set[ff.CookieExceptionRule],
-    ) -> Self:
-        modified = set()
-        for i in newState:
-            for j in oldState:
-                if i != j and i.origin == j.origin:
-                    modified.add(i)
-        return cls(
-            set(newState) - set(oldState), set(oldState) - set(newState), modified
+    except webdav.Error as e:
+        logger.error(f"Failed to upload sync file: {e.reason}")
+        exit(1)
+
+
+def intervalToSeconds(interval: str) -> int:
+    if interval[-1] == "s":
+        return int(interval[:-1])
+    elif interval[-1] == "m":
+        return int(interval[:-1]) * 60
+    elif interval[-1] == "h":
+        return int(interval[:-1]) * 60 * 60
+    elif interval[-1] == "d":
+        return int(interval[:-1]) * 60 * 60 * 24
+    else:
+        logger.error("Invalid interval")
+        exit(1)
+
+
+def backupSyncState(config_dir: Path, sync_interval: str) -> None:
+    if not os.path.exists(config_dir / "backups"):
+        os.mkdir(config_dir / "backups")
+
+    # Check if the mtime of the backup directory is older than the interval
+    mtime = os.path.getmtime(config_dir / "backups")
+    if datetime.now().timestamp() - mtime > intervalToSeconds(sync_interval):
+        logger.info("Making backup")
+        assert os.path.exists(
+            config_dir / "last_sync_state.json"
+        ), "No last sync state found"
+
+        iso_date = datetime.now().isoformat()[:19].replace(":", "-")
+        shutil.copyfile(
+            config_dir / "last_sync_state.json",
+            config_dir / "backups" / f"backup_{iso_date}.json",
         )
+    else:
+        logger.info("Backup interval not reached")
+
+
+def mergeChanges(
+    mergeStatergy: str, local_state: dict, remote_state: dict
+) -> dict | None:
+    if mergeStatergy == "use_newest":
+        if local_state["syncDate"] > remote_state["syncDate"]:
+            return local_state
+        else:
+            return remote_state
+    elif mergeStatergy == "use_local":
+        return local_state
+    elif mergeStatergy == "use_remote":
+        return remote_state
+    elif mergeStatergy == "do_nothing":
+        return None
+    else:
+        logger.error("Invalid merge statergy")
+        exit(1)
+
+
+def saveLastSyncState(config: Config, syncState: dict) -> None:
+    with open(config.config_dir / "last_sync_state.json", "w") as file:
+        json.dump(syncState, file, cls=ff.CustomEncoder, indent=4)
 
 
 def main() -> None:
@@ -213,38 +233,76 @@ def main() -> None:
     createSyncDir(webdavClient)
 
     # Fetch the last sync state from disk
-    with open(config.config_dir / "last_sync_state.json", "r") as file:
-        local_sync_state = json.load(file)
-
-    # Fetch the remote sync state
-    remoteSyncState = downloadSyncState(webdavClient)
-
-    # Compare the remote sync state with the last (local) sync state
-    if local_sync_state["syncDate"] < remoteSyncState["syncDate"]:
-        remoteChanges = Changes.computeDiff(
-            set(local_sync_state["exceptionRules"]),
-            set(remoteSyncState["exceptionRules"]),
-        )
+    if os.path.exists(config.config_dir / "last_sync_state.json"):
+        with open(config.config_dir / "last_sync_state.json", "r") as file:
+            last_sync_state = json.load(file)
     else:
-        logger.info("No remote changes")
+        logger.info(
+            "No last sync state found, using empty state (that will be replaced by remote state)"
+        )
+        last_sync_state = {
+            "syncDate": datetime(1970, 1, 1).isoformat(),
+            "exceptionRules": ff.getExceptions(ffConn),
+        }
 
-    # Compare out ff exceptions with the last (local) sync state
-    # Because we can't easily get the date of the last modification of the ff exceptions (well for the modifications we can but now for the removals), so we just asssume that they were just now modified
-    localFFExceptions = ff.getExceptions(ffConn)
-    localChanges = Changes.computeDiff(
-        set(local_sync_state["exceptionRules"]), set(localFFExceptions)
+    local_state = {
+        "syncDate": datetime.now().isoformat(),
+        "exceptionRules": ff.getExceptions(ffConn),
+    }
+
+    # Are there any new local changes?
+    new_local_changes = set(last_sync_state["exceptionRules"]) != set(
+        local_state["exceptionRules"]
     )
 
-    # Merge the two sets of changes
-    mergedChanges = Changes.mergeChanges(localChanges, remoteChanges)
+    # Fetch the remote sync state
+    remote_state = downloadSyncState(webdavClient)
 
-    if not args.simulate:
-        # Apply the merged changes to our local ff exceptions
-        applyChanges(ffConn, mergedChanges)
+    # Handle possible panic states
+    panic_detected = False
+    if len(remote_state["exceptionRules"]) == 0:
+        logger.error("Remote sync file is empty")
+        panic_detected = True
+    if len(local_state["exceptionRules"]) == 0:
+        logger.error("Local sync file is empty")
+        panic_detected = True
+    if config.get("sync", "panic") and panic_detected:
+        logger.error("Panic detected, exiting")
+        exit(1)
 
-        # Save our now modified last sync state to disk
-        with open(config.config_dir / "last_sync_state.json", "w") as file:
-            json.dump(mergedChanges, file, cls=ff.CustomEncoder, indent=4)
+    if last_sync_state["syncDate"] < remote_state["syncDate"] and not new_local_changes:
+        # Replace local rules with remote rules
+        logger.info("Remote changes")
+        if not args.simulate:
+            ff.replaceRules(ffConn, remote_state["exceptionRules"])
+            saveLastSyncState(config, local_state)
+    elif local_state["syncDate"] < remote_state["syncDate"] and new_local_changes:
+        # Merge local changes with remote rules by using the specified merge strategy (e.g. use newest)
+        logger.info("Remote changes and local changes, using specified merge strategy")
+        merged_state = mergeChanges(
+            config.get("sync", "merge_statergy"), local_state, remote_state
+        )
+        if merged_state is None:
+            logger.info("Do nothing")
+        elif not args.simulate:
+            ff.replaceRules(ffConn, merged_state["exceptionRules"])
+            uploadSyncState(webdavClient, merged_state)
+            saveLastSyncState(config, local_state)
+    elif local_state["syncDate"] == remote_state["syncDate"] and not new_local_changes:
+        # Do nothing
+        logger.info("No remote changes and no local changes")
+        exit(0)
+    elif local_state["syncDate"] == remote_state["syncDate"] and new_local_changes:
+        # Upload local changes to remote
+        logger.info("No remote changes but local changes")
+        if not args.simulate:
+            uploadSyncState(webdavClient, local_state)
+            saveLastSyncState(config, local_state)
+    else:
+        logger.error("Impossible state reached")
+        exit(1)
 
-        # Upload our now modified last sync state to the remote
-        uploadSyncState(webdavClient, mergedChanges)
+    # Make backups
+    if config.get("backup", "enabled"):
+        logger.info("Making backup")
+        backupSyncState(config.config_dir, config.get("backup", "interval"))

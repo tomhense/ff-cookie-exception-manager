@@ -7,7 +7,6 @@ from enum import Enum
 from pathlib import Path
 
 from ff_cookie_exception_manager import logger
-from ff_cookie_exception_manager.sync import Changes
 
 """
 What to insert in table moz_perms:
@@ -246,5 +245,6 @@ def deleteAllExceptions(conn: sqlite3.Connection) -> None:
     logger.info(f"Successfully deleted {deletedCount} cookie exceptions")
 
 
-def applyChanges(conn: sqlite3.Connection, changes: Changes) -> None:
-    cursor = conn.cursor()
+def replaceRules(conn: sqlite3.Connection, rules: list[CookieExceptionRule]) -> None:
+    deleteAllExceptions(conn)
+    importRules(conn, rules)
