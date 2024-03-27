@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ff_cookie_exception_manager"
+license = {text = "GPL-3.0"}
+version = "0.0.2"
+description = "Manage FireFox cookie exceptions"
+readme = "README.md"
+requires-python = ">=3.6"
+dependencies = ["requests", "types-requests"]
+authors = [
+    {name = "Tom Hense", email = "example@example.com"}
+]
+
+[project.scripts]
+ff-cookie-exception-manager = "ff_cookie_exception_manager.cli:main"
+ff-cookie-exception-manager-sync = "ff_cookie_exception_manager.sync:main"
