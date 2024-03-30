@@ -187,12 +187,17 @@ def intervalToDelta(interval: str) -> timedelta:
 
 
 def backupSyncState(config_dir: Path, sync_interval: str) -> None:
+    FORCE_BACKUP = False
     if not os.path.exists(config_dir / "backups"):
         os.mkdir(config_dir / "backups")
+        FORCE_BACKUP = True
 
     # Check if the mtime of the backup directory is older than the interval
     mtime = os.path.getmtime(config_dir / "backups")
-    if datetime.now() - datetime.fromtimestamp(mtime) > intervalToDelta(sync_interval):
+    if (
+        datetime.now() - datetime.fromtimestamp(mtime) > intervalToDelta(sync_interval)
+        or FORCE_BACKUP
+    ):
         logger.info("Making backup")
         assert os.path.exists(
             config_dir / "last_sync_state.json"
