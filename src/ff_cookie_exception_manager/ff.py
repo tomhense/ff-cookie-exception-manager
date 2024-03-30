@@ -127,7 +127,7 @@ class CookieExceptionRule:
     def from_dict(cls, d):
         return cls(
             d["origin"],
-            cls.Permission(d["permission"]),
+            cls.Permission[d["permission"]],
             datetime.fromisoformat(d["modificationTime"]),
         )
 

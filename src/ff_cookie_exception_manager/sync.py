@@ -6,6 +6,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import overload
 
 from ff_cookie_exception_manager import ff, logger, webdav
 
@@ -21,11 +22,11 @@ class Config:
             with open(self.config_path, "w") as file:
                 file.write(
                     importlib.resources.read_text(
-                        "ff_cookie_exception_manager", "config.ini"
+                        "ff_cookie_exception_manager.resources", "config.ini"
                     )
                 )
 
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(inline_comment_prefixes=("#"))
         self.config.read(self.config_path)
 
     def getXDGConfigHome(self) -> Path:
@@ -35,10 +36,22 @@ class Config:
             XDG_CONFIG_HOME = "~/.config"
         return Path(os.path.expanduser(XDG_CONFIG_HOME))
 
-    def get(self, section: str, option: str) -> str:
-        return self.config.get(section, option)
+    # Overload get method to make typing work with the optional fallback argument (return value can only be None if fallback is None)
+    @overload
+    def get(self, section, option, *, raw=False, vars=None, fallback: str) -> str: ...
 
-    def set(self, section: str, option: str, value: str) -> None:
+    @overload
+    def get(
+        self, section, option, *, raw=False, vars=None, fallback: None = None
+    ) -> str | None: ...
+
+    def get(
+        self, section, option, *, raw=False, vars=None, fallback=None
+    ) -> str | None:
+
+        return self.config.get(section, option, raw=raw, vars=vars, fallback=fallback)
+
+    def set(self, section, option, value: str | None = None) -> None:
         if not self.config.has_section(section):
             self.config.add_section(section)
         self.config.set(section, option, value)
@@ -72,7 +85,7 @@ def getFFProfile(config: Config) -> ff.FFProfile:
     elif profileName is not None:  # Get profile by given profile name:
         profile = next(
             (i for i in ff.getProfiles() if i.path == profileName),
-            None,
+            None,  # type: ignore[arg-type]
         )
         if profile is None:
             logger.error("No profile with that given name was found")
@@ -82,7 +95,7 @@ def getFFProfile(config: Config) -> ff.FFProfile:
         if not os.path.isdir(profilePath):
             logger.error("Given profile path is not a directory")
             exit(1)
-        profile = next((i for i in ff.getProfiles() if i.path == profilePath), None)
+        profile = next((i for i in ff.getProfiles() if i.path == profilePath), None)  # type: ignore[arg-type]
         if profile is None:
             logger.error("No profile with that given path was found")
             exit(1)
@@ -108,21 +121,19 @@ def createSyncDir(webdavClient: webdav.WebDAVClient) -> None:
             exit(1)
 
 
-def downloadSyncState(webdavClient: webdav.WebDAVClient) -> dict:
+def downloadSyncState(webdavClient: webdav.WebDAVClient) -> dict | None:
     # Download the exceptions file
     try:
         resp_text = webdavClient.download("/ff-cookie-exceptions/sync.json")
     except webdav.Error as e:
         if e.status_code == 404:
-            logger.error("No sync file found")
-            exit(1)
+            return None
         else:
             logger.error(f"Failed to download sync file: {e.reason}")
             exit(1)
 
     # Parse the exceptions file
-    syncState = json.loads(resp_text, cls=ff.CustomDecoder)
-    return syncState
+    return json.loads(resp_text, cls=ff.CustomDecoder)
 
 
 def uploadSyncState(
@@ -130,7 +141,6 @@ def uploadSyncState(
     syncState: dict,
     path: str = "/ff-cookie-exceptions/sync.json",
 ) -> None:
-    # Upload the exceptions
     try:
         webdavClient.upload(
             path,
@@ -149,6 +159,7 @@ def backupSyncStateRemote(webdavClient: webdav.WebDAVClient) -> None:
     # Not used currently
     try:
         sync_state = downloadSyncState(webdavClient)
+        assert sync_state is not None, "No remote sync state found"
         iso_date = datetime.now().isoformat()[:19].replace(":", "-")
         uploadSyncState(
             webdavClient,
@@ -247,14 +258,14 @@ def main() -> None:
     # Fetch the last sync state from disk
     if os.path.exists(config.config_dir / "last_sync_state.json"):
         with open(config.config_dir / "last_sync_state.json", "r") as file:
-            last_sync_state = json.load(file)
+            last_sync_state = json.load(file, cls=ff.CustomDecoder)
     else:
         logger.info(
             "No last sync state found, using empty state (that will be replaced by remote state)"
         )
         last_sync_state = {
             "syncDate": datetime(1970, 1, 1).isoformat(),
-            "exceptionRules": ff.getExceptions(ffConn),
+            "exceptionRules": [],
         }
 
     local_state = {
@@ -266,13 +277,29 @@ def main() -> None:
     new_local_changes = set(last_sync_state["exceptionRules"]) != set(
         local_state["exceptionRules"]
     )
+    logger.debug(f"New local changes: {new_local_changes}")
 
     # Fetch the remote sync state
     remote_state = downloadSyncState(webdavClient)
+    IS_INITIAL_SYNC = remote_state is None
+    if remote_state is None:
+        logger.info("No remote sync state found, creating empty state (initial sync)")
+        remote_state = {
+            "syncDate": datetime(1970, 1, 1).isoformat(),
+            "exceptionRules": [],
+        }
+        if not args.simulate:
+            uploadSyncState(webdavClient, remote_state)
+
+    logger.debug(f"Local state rules count: {len(local_state['exceptionRules'])}")
+    logger.debug(
+        f"Last sync state rules count: {len(last_sync_state['exceptionRules'])}"
+    )
+    logger.debug(f"Remote state rules count: {len(remote_state['exceptionRules'])}")
 
     # Handle possible panic states
     panic_detected = False
-    if len(remote_state["exceptionRules"]) == 0:
+    if len(remote_state["exceptionRules"]) == 0 and not IS_INITIAL_SYNC:
         logger.error("Remote sync file is empty")
         panic_detected = True
     if len(local_state["exceptionRules"]) == 0:
@@ -288,11 +315,13 @@ def main() -> None:
         if not args.simulate:
             ff.replaceRules(ffConn, remote_state["exceptionRules"])
             saveLastSyncState(config, local_state)
-    elif local_state["syncDate"] < remote_state["syncDate"] and new_local_changes:
+    elif last_sync_state["syncDate"] < remote_state["syncDate"] and new_local_changes:
         # Merge local changes with remote rules by using the specified merge strategy (e.g. use newest)
         logger.info("Remote changes and local changes, using specified merge strategy")
         merged_state = mergeChanges(
-            config.get("sync", "merge_statergy"), local_state, remote_state
+            config.get("sync", "merge_statergy", fallback="use_newest"),
+            local_state,
+            remote_state,
         )
         if merged_state is None:
             logger.info("Do nothing")
@@ -300,11 +329,14 @@ def main() -> None:
             ff.replaceRules(ffConn, merged_state["exceptionRules"])
             uploadSyncState(webdavClient, merged_state)
             saveLastSyncState(config, local_state)
-    elif local_state["syncDate"] == remote_state["syncDate"] and not new_local_changes:
+    elif (
+        last_sync_state["syncDate"] == remote_state["syncDate"]
+        and not new_local_changes
+    ):
         # Do nothing
         logger.info("No remote changes and no local changes")
         exit(0)
-    elif local_state["syncDate"] == remote_state["syncDate"] and new_local_changes:
+    elif last_sync_state["syncDate"] == remote_state["syncDate"] and new_local_changes:
         # Upload local changes to remote
         logger.info("No remote changes but local changes")
         if not args.simulate:
@@ -316,5 +348,6 @@ def main() -> None:
 
     # Make backups
     if config.get("backup", "enabled"):
-        logger.info("Making backup")
-        backupSyncState(config.config_dir, config.get("backup", "interval"))
+        backup_sync_interval = config.get("backup", "interval")
+        assert backup_sync_interval is not None, "Backup interval not set"
+        backupSyncState(config.config_dir, backup_sync_interval)
