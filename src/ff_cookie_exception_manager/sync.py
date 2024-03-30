@@ -4,7 +4,7 @@ import importlib.resources
 import json
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import overload
 
@@ -172,15 +172,15 @@ def backupSyncStateRemote(webdavClient: webdav.WebDAVClient) -> None:
         exit(1)
 
 
-def intervalToSeconds(interval: str) -> int:
+def intervalToDelta(interval: str) -> timedelta:
     if interval[-1] == "s":
-        return int(interval[:-1])
+        return timedelta(seconds=int(interval[:-1]))
     elif interval[-1] == "m":
-        return int(interval[:-1]) * 60
+        return timedelta(minutes=int(interval[:-1]))
     elif interval[-1] == "h":
-        return int(interval[:-1]) * 60 * 60
+        return timedelta(hours=int(interval[:-1]))
     elif interval[-1] == "d":
-        return int(interval[:-1]) * 60 * 60 * 24
+        return timedelta(days=int(interval[:-1]))
     else:
         logger.error("Invalid interval")
         exit(1)
@@ -192,7 +192,7 @@ def backupSyncState(config_dir: Path, sync_interval: str) -> None:
 
     # Check if the mtime of the backup directory is older than the interval
     mtime = os.path.getmtime(config_dir / "backups")
-    if datetime.now().timestamp() - mtime > intervalToSeconds(sync_interval):
+    if datetime.now() - datetime.fromtimestamp(mtime) > intervalToDelta(sync_interval):
         logger.info("Making backup")
         assert os.path.exists(
             config_dir / "last_sync_state.json"
@@ -204,7 +204,7 @@ def backupSyncState(config_dir: Path, sync_interval: str) -> None:
             config_dir / "backups" / f"backup_{iso_date}.json",
         )
     else:
-        logger.info("Backup interval not reached")
+        logger.debug("Backup interval not reached")
 
 
 def mergeChanges(
@@ -243,10 +243,13 @@ def main() -> None:
     ffProfile = getFFProfile(config)
     ffConn = ff.openDatabase(ffProfile)
 
+    assert config.get("webdav", "url") is not None, "WebDAV URL not set"
+    assert config.get("webdav", "username") is not None, "WebDAV username not set"
+    assert config.get("webdav", "password") is not None, "WebDAV password not set"
     webdavClient = webdav.WebDAVClient(
-        config.get("webdav", "url"),
-        config.get("webdav", "username"),
-        config.get("webdav", "password"),
+        config.get("webdav", "url", fallback=""),
+        config.get("webdav", "username", fallback=""),
+        config.get("webdav", "password", fallback=""),
     )
 
     if not webdavClient.selfcheck():
@@ -305,16 +308,16 @@ def main() -> None:
     if len(local_state["exceptionRules"]) == 0:
         logger.error("Local sync file is empty")
         panic_detected = True
-    if config.get("sync", "panic") and panic_detected:
+    if config.get("sync", "panic", fallback="YES").upper() != "NO" and panic_detected:
         logger.error("Panic detected, exiting")
         exit(1)
 
     if last_sync_state["syncDate"] < remote_state["syncDate"] and not new_local_changes:
         # Replace local rules with remote rules
-        logger.info("Remote changes")
+        logger.info("Remote changes and no local changes")
         if not args.simulate:
             ff.replaceRules(ffConn, remote_state["exceptionRules"])
-            saveLastSyncState(config, local_state)
+            saveLastSyncState(config, remote_state)
     elif last_sync_state["syncDate"] < remote_state["syncDate"] and new_local_changes:
         # Merge local changes with remote rules by using the specified merge strategy (e.g. use newest)
         logger.info("Remote changes and local changes, using specified merge strategy")
@@ -328,14 +331,13 @@ def main() -> None:
         elif not args.simulate:
             ff.replaceRules(ffConn, merged_state["exceptionRules"])
             uploadSyncState(webdavClient, merged_state)
-            saveLastSyncState(config, local_state)
+            saveLastSyncState(config, merged_state)
     elif (
         last_sync_state["syncDate"] == remote_state["syncDate"]
         and not new_local_changes
     ):
         # Do nothing
         logger.info("No remote changes and no local changes")
-        exit(0)
     elif last_sync_state["syncDate"] == remote_state["syncDate"] and new_local_changes:
         # Upload local changes to remote
         logger.info("No remote changes but local changes")
@@ -347,7 +349,7 @@ def main() -> None:
         exit(1)
 
     # Make backups
-    if config.get("backup", "enabled"):
+    if config.get("backup", "enabled", fallback="NO").upper() == "YES":
         backup_sync_interval = config.get("backup", "interval")
         assert backup_sync_interval is not None, "Backup interval not set"
         backupSyncState(config.config_dir, backup_sync_interval)
