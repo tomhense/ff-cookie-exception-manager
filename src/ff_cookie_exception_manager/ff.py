@@ -242,9 +242,19 @@ def deleteAllExceptions(conn: sqlite3.Connection) -> None:
     ).rowcount
     conn.commit()  # Save changes
     logger.info(f"Successfully deleted {deletedCount} cookie exceptions")
-    logger.info(f"Successfully deleted {deletedCount} cookie exceptions")
 
 
 def replaceRules(conn: sqlite3.Connection, rules: list[CookieExceptionRule]) -> None:
-    deleteAllExceptions(conn)
-    importRules(conn, rules)
+    assert len(rules) > 0, "No rules provided"  # Sanity check
+
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM moz_perms WHERE type = 'cookie'")
+    cursor.executemany(
+        "INSERT INTO moz_perms(origin,type,permission,expireType,expireTime,modificationTime) VALUES(?, 'cookie', ?, 0, 0, ?)",
+        [
+            (rule.origin, rule.permission.value, rule.modificationTimestamp)
+            for rule in rules
+        ],
+    )
+    conn.commit()  # Save changes
+    logger.info("Successfully replaced all cookie exceptions")

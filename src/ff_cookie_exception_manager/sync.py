@@ -1,5 +1,6 @@
 import argparse
 import configparser
+import importlib.resources
 import json
 import os
 import shutil
@@ -13,6 +14,17 @@ class Config:
     def __init__(self) -> None:
         self.config_dir = self.getXDGConfigHome() / "ff-cookie-exceptions-sync"
         self.config_path = self.config_dir / "config.ini"
+
+        if not os.path.exists(self.config_dir):
+            os.mkdir(self.config_dir)
+        if not os.path.exists(self.config_path):
+            with open(self.config_path, "w") as file:
+                file.write(
+                    importlib.resources.read_text(
+                        "ff_cookie_exception_manager", "config.ini"
+                    )
+                )
+
         self.config = configparser.ConfigParser()
         self.config.read(self.config_path)
 
