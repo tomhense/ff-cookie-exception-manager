@@ -41,7 +41,6 @@ def createParser():
         metavar="file",
         help="Export exceptions to file or stdout",
     )
-    parser.add_argument("--list", "-l", action="store_true", help="List exceptions")
     parser.add_argument(
         "--clear", action="store_true", help="Clear all cookie exceptions"
     )
@@ -82,11 +81,6 @@ def exportRulesToFile(filePath: Path, rules: list[ff.CookieExceptionRule]):
     else:
         with open(filePath, "w") as exportFile:
             json.dump(rules, exportFile, cls=ff.CustomEncoder, indent=4)
-
-
-def listExceptions(exceptions: list[ff.CookieExceptionRule]):
-    for exception in exceptions:
-        print(f"{exception.origin} {exception.permission} {exception.modificationTime}")
 
 
 def main() -> None:
@@ -142,9 +136,6 @@ def main() -> None:
         if args.import_file is not None:
             rules = readRulesFromFile(args.import_file)
             ff.importRules(conn, rules, args.update_existing)
-
-        if args.list:
-            listExceptions(ff.getExceptions(conn))
 
         if args.export_file is not None:
             rules = ff.getExceptions(conn)
